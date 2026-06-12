@@ -1,2 +1,5 @@
 # 环境目录
 .venv/
+
+# marimo
+__marimo__/
