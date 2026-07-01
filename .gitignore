@@ -2,4 +2,7 @@
 .venv/
 
 # marimo
-__marimo__/
+*__marimo__/
+
+# 网络参数文件
+*.pt
