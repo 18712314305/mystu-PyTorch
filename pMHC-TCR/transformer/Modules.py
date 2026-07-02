@@ -588,11 +588,11 @@ def _(mo):
     ## 测试
 
     - multi encoder 数据流验证成功: 3*list -> [batch, length(72), dim(256)]
+    - torchinfo模块的summary函数, 获取当前模型总参数了, 预估训练总显存 2G 左右
 
     ___
 
     ## 待学习
-    - nn.dropout 对象
     - nn.moduleList 对象
     - 通过 hook 捕获输出
     - 当前模型总参数量
@@ -624,12 +624,19 @@ def _(device, pTcrTransformerV01):
 @app.cell
 def _(atgList, hlaList, tcrList, testModel):
     resVec, resLogit = testModel(tcrList, hlaList, atgList)
-    return (resLogit,)
+    return
 
 
 @app.cell
-def _(resLogit):
-    resLogit.shape
+def _():
+    from torchinfo import summary
+
+    return (summary,)
+
+
+@app.cell
+def _(summary, testModel):
+    summary(testModel)
     return
 
 
