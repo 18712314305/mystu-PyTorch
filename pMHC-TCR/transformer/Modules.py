@@ -17,14 +17,15 @@ def _(mo):
        - TCR-pMHC 实现
        - 预检验: 训练前就看一下编码方法可能好不好, 热图法、表征相似度分析
     5. 多头自注意力模块
-    6. 残差连接
-    7. 层归一化模块
-    8. 前馈网络
+    6. 多轮encoder
+    7. decoder
+
+    可不可以分段训练? 让 encoder 学习把阳性 pair 聚类, 把 阴性 pair 聚类
     """)
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def need_module_import():
     import marimo as mo
 
@@ -45,7 +46,7 @@ def need_module_import():
     return Path, math, mo, nn, np, os, random, torch
 
 
-@app.cell
+@app.cell(hide_code=True)
 def need_global_variable(Path, np, os, random, torch):
     # project dir
     projDir = Path(os.getcwd()) / "pMHC-TCR/"
@@ -63,7 +64,7 @@ def need_global_variable(Path, np, os, random, torch):
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = False
     FixRandomSeed()
-    return
+    return (device,)
 
 
 @app.cell(hide_code=True)
@@ -81,11 +82,11 @@ def _(mo):
     return
 
 
-@app.cell
+@app.cell(hide_code=True)
 def padding_module(nn, torch):
     class ThreeSeqPadding(nn.Module):
         # read embedding and padding module
-        # input: tcr tensor batch, for each element, it's the embeding matrix of one sequence, the matrix = [SeqLength * EmbedFeatures]
+        # input: tcr list, for each element, it's the embeding matrix of one sequence, the matrix = [SeqLength * EmbedFeatures]
         # output: junc matrix[Batch * Length * 1280], where Length = tcrMaxLen + hlaMaxLen + atgMaxLen, Batch is length of input list, equals to the number of TCR-pMHC pairs
         def __init__(self, tcrMaxLen=25, hlaMaxLen=34, atgMaxLen=13, embedDim = 1280):
             super(ThreeSeqPadding, self).__init__()
@@ -105,7 +106,7 @@ def padding_module(nn, torch):
 
         def __padList(self, inMatList, inMaxLen):
             device = inMatList[0].device
-            batchSize = inMatList.shape[0]
+            batchSize = len(inMatList)
             padTensor = torch.zeros(batchSize, inMaxLen, self.embedDim, device=device, dtype=torch.bfloat16)
             maskTensor = torch.zeros(batchSize, inMaxLen, device=device, dtype=torch.bool)
             for inIdx, inMat in enumerate(inMatList):
@@ -130,7 +131,7 @@ def padding_module(nn, torch):
             conMask = self.__concatList(tcrBatchTensor=tcrMask, hlaBatchTensor=hlaMask, atgBatchTensor=atgMask)
             return conBatch, conMask
 
-    return
+    return (ThreeSeqPadding,)
 
 
 @app.cell(hide_code=True)
@@ -141,8 +142,8 @@ def _(mo):
     return
 
 
-@app.cell
-def _(nn, torch):
+@app.cell(hide_code=True)
+def position_encode_module(nn, torch):
     class PositionBiasMat(nn.Module):
         # create position bias matrix which will add to the attention matrix (Q@K.T + bias)
         # input: tensor [batch, matrix], martix = Q@K.T
@@ -200,7 +201,7 @@ def _(nn, torch):
             batchMaskBias = batchPosBias.masked_fill(maskMat, -1e9)
             return batchMaskBias
 
-        def forward(self, batchRawAttention, batchMask):
+        def forward(self, batchMask):
             # input:
                 # batchRawAttention: [B*72*72]
                 # batchMask: [B*72]
@@ -209,11 +210,11 @@ def _(nn, torch):
             device = batchMask.device
             posBias = self.posTable(self.Fixed_Related_Position_Idx_Matrix).squeeze(-1).unsqueeze(0) # 72*72*1 -> 72*72 -> 1*72*72, 1为了广播Batch
             batchMaskPosBias = self.__maskBias(batchPosBias=posBias, batchMask=batchMask)
-            batchRawAttention.add_(batchMaskPosBias)
-            return batchRawAttention
-        
+            # batchRawAttention = batchRawAttention + batchMaskPosBias
+            return batchMaskPosBias
 
-    return
+
+    return (PositionBiasMat,)
 
 
 @app.cell(hide_code=True)
@@ -224,8 +225,8 @@ def _(mo):
     return
 
 
-@app.cell
-def _(math, nn, torch):
+@app.cell(hide_code=True)
+def attention_module(math, nn, torch):
     class MultiHeadAttention(nn.Module):
         # 多头注意力机制
         # input: [B, length(72),hiddenDim]
@@ -236,14 +237,14 @@ def _(math, nn, torch):
             self.numberHead = numberHead
 
             # 多头权重矩阵
-            self.Wq = nn.Linear(hiddenDim, hiddenDim)
-            self.Wk = nn.Linear(hiddenDim, hiddenDim)
-            self.Wv = nn.Linear(hiddenDim, hiddenDim)
+            self.Wq = nn.Linear(hiddenDim, hiddenDim, dtype=torch.bfloat16)
+            self.Wk = nn.Linear(hiddenDim, hiddenDim, dtype=torch.bfloat16)
+            self.Wv = nn.Linear(hiddenDim, hiddenDim, dtype=torch.bfloat16)
             self.Dk = hiddenDim // numberHead
             self.scale = math.sqrt(self.Dk)
             # 上下文线性融合
-            self.ConLinear = nn.Linear(hiddenDim, hiddenDim)
-        
+            self.ConLinear = nn.Linear(hiddenDim, hiddenDim, dtype=torch.bfloat16)
+
         def forward(self, 
             X, # [batch * length(72) * hiddenDim]
             posiBias, # [batch * length * length]
@@ -266,17 +267,17 @@ def _(math, nn, torch):
             # 加上位置偏置
             QK = QK + posiBias.unsqueeze(1) # 先把位置偏置变成 [batch * 1 * length * length]
             # softmax
-            A = torch.softmax(QK, dim=-1) # [batch * head * length * length]
+            A = torch.softmax(QK, dim=-1, dtype=torch.bfloat16) # [batch * head * length * length]
             # QKV
             AV = torch.matmul(A, multiV) # [batch * head * length * dk]
             # 合并多头
             context = AV.permute(0, 2, 1, 3).contiguous().view(batchSize, seqLeng, self.hiddenDim)
             context = self.ConLinear(context)
             return context # [batch * length(72) * hiddenDim]
-        
-        
 
-    return
+
+
+    return (MultiHeadAttention,)
 
 
 @app.cell(hide_code=True)
@@ -287,8 +288,8 @@ def _(mo):
     return
 
 
-@app.cell
-def _(nn):
+@app.cell(hide_code=True)
+def fnn_module(nn, torch):
     class FNN(nn.Module):
         # input: [batch, length, hiddenDim], 多头注意力模块输出的维度
         # output: [batch, length, hiddenDim], 与输入完全相同的形状
@@ -300,8 +301,8 @@ def _(nn):
             self.dropoutP = dropoutP
             self.upDim = self.hiddenDim * self.hiddenFold
             # 两层网络
-            self.up = nn.Linear(self.hiddenDim, self.upDim)
-            self.down = nn.Linear(self.upDim, self.hiddenDim)
+            self.up = nn.Linear(self.hiddenDim, self.upDim, dtype=torch.bfloat16)
+            self.down = nn.Linear(self.upDim, self.hiddenDim, dtype=torch.bfloat16)
             # 激活函数
             self.activation = nn.GELU()
             # dropout
@@ -313,9 +314,9 @@ def _(nn):
             out = self.drop(out)
             out = self.down(out) # [batch, length, hiddenDim]
             return out
-        
 
-    return
+
+    return (FNN,)
 
 
 @app.cell(hide_code=True)
@@ -326,12 +327,16 @@ def _(mo):
     return
 
 
-app._unparsable_cell(
-    r"""
+@app.cell(hide_code=True)
+def encoder_single(FNN, MultiHeadAttention, PositionBiasMat, nn, torch):
     class pTcrEncoder(nn.Module):
-        # in
-        # out
-        def __init__(self, rowDim=1280, featureDim=256, attentionDim=256, upDimFold=4, dropoutP=0.1, numberHead=8):
+        # in: padding + 降维后的 tcr-pMHC 序列矩阵, [batch, length(72), dim(256)]
+        # out: [batch, length(72), dim(256)]
+            # 输入与输出的同形状保证了 encoder 的串联
+        def __init__(self, 
+                     rowDim=1280, featureDim=256, attentionDim=256, upDimFold=4, dropoutP=0.1, numberHead=8,  
+                     tcrMaxLen=25, hlaMaxLen=34, atgMaxLen=13, maxRelDist=16):
+            super(pTcrEncoder, self).__init__()
             # 属性
             self.rowDim = rowDim
             self.featureDim = featureDim # 对 ESM2 提取的 1280 维特征降维提取
@@ -339,136 +344,292 @@ app._unparsable_cell(
             self.numberHead = numberHead # 注意力头数
             self.upDimFold = upDimFold # 前馈神经网络中对 注意力context 升维的倍数
             self.dropoutP = dropoutP # dropout 概率
+            self.tcrMaxLen = tcrMaxLen
+            self.hlaMaxLen = hlaMaxLen
+            self.atgMaxLen = atgMaxLen
+            self.maxRelDist = maxRelDist
             # 架构
-            self.featExtract = nn.Linear(self.rowDim, self.featureDim) # [batch, length, rowDim] -> [batch, length, featureDim]
-            self.layerNorm = nn.LayerNorm(self.featureDim) # 用于多头注意力机制的输入
+            self.posEncode = PositionBiasMat(
+                tcrMaxLen=self.tcrMaxLen, hlaMaxLen=self.hlaMaxLen, atgMaxLen=self.atgMaxLen, maxRelDist=self.maxRelDist
+            )
+            self.layerNorm1 = nn.LayerNorm(self.featureDim, dtype=torch.bfloat16) # 用于多头注意力机制的输入
+            self.layerNorm2 = nn.LayerNorm(self.featureDim, dtype=torch.bfloat16) # 用于FNN的输入
             self.multiAttention = MultiHeadAttention(hiddenDim=self.attentionDim, numberHead=self.numberHead)
-            self.dropAttention = nn.Dropout(self.dropoutP) # 多头注意力输出的dropout
-            self.
-    """,
-    name="_"
-)
+            self.drop = nn.Dropout(self.dropoutP) # 
+            self.FNN = FNN(hiddenDim=self.attentionDim, hiddenFold=self.upDimFold, dropoutP=self.dropoutP)
+
+        def forward(self, X, padSeq, padMask):
+            # 位置编码
+            posBias = self.posEncode(padMask) # [batch, length(72), length(72)] -> [batch, length(72), length(72)]
+            # pre-LN
+            LN_downDimSeq = self.layerNorm1(X) # [batch, length(72), dim(256)] -> [batch, length(72), dim(256)]
+            # 多头注意力
+            attentionSeq = self.multiAttention(LN_downDimSeq, posBias) # [batch, length(72), dim(256)] -> [batch, length(72), dim(256)]
+            # 注意力 dropout
+            attentionSeq = self.drop(attentionSeq)
+            # 残差连接
+            attentionRes = attentionSeq + X
+            # pre-LN
+            LN_attentionSeq = self.layerNorm2(attentionRes) # [batch, length(72), dim(256)] -> [batch, length(72), dim(256)]
+            # 前馈网络
+            fnnSeq = self.FNN(LN_attentionSeq) # [batch, length(72), dim(256)] -> [batch, length(72), dim(256)]
+            # drop
+            fnnSeq = self.drop(fnnSeq)
+            # 残差连接
+            fnnRes = fnnSeq + attentionRes
+
+            return fnnRes
+
+    return (pTcrEncoder,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## stack encoder to transformer
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def enocoder_stack(ThreeSeqPadding, nn, pTcrEncoder, torch):
+    class pTcrStackEncoder(nn.Module):
+        # input: tcr tensor [batch, seq, feature], seq 时不定长的
+        # output: [batch, length(72), dim(256)], 这是经过三层注意力的(3xEncoder)
+        def __init__(self, rowDim=1280, featureDim=256, attentionDim=256, upDimFold=4, dropoutP=0.1, numberHead=8,  
+                     tcrMaxLen=25, hlaMaxLen=34, atgMaxLen=13, maxRelDist=16, encoderTime=3):
+            super(pTcrStackEncoder, self).__init__()
+            self.rowDim = rowDim
+            self.featureDim = featureDim
+            self.attentionDim = attentionDim
+            self.upDimFold = upDimFold
+            self.dropoutP = dropoutP
+            self.numberHead = numberHead
+            self.tcrMaxLen = tcrMaxLen
+            self.hlaMaxLen = hlaMaxLen
+            self.atgMaxLen = atgMaxLen
+            self.maxRelDist = maxRelDist
+            self.encoderTime = encoderTime
+
+            # 架构
+            self.padding = ThreeSeqPadding(tcrMaxLen=self.tcrMaxLen,hlaMaxLen=self.hlaMaxLen,atgMaxLen=self.atgMaxLen,embedDim=self.rowDim)
+            self.downDim = nn.Linear(self.rowDim, self.featureDim, dtype=torch.bfloat16)
+            self.multiEncoder = nn.ModuleList(
+                pTcrEncoder(
+                    rowDim=self.rowDim, featureDim=self.featureDim, attentionDim=self.attentionDim, 
+                    upDimFold=self.upDimFold, dropoutP=self.dropoutP, numberHead=self.numberHead,  
+                    tcrMaxLen=self.tcrMaxLen, hlaMaxLen=self.hlaMaxLen, atgMaxLen=self.atgMaxLen, maxRelDist=self.maxRelDist
+                ) for _ in range(encoderTime)
+            )
+
+        def forward(self, tcrMatList, hlaMatList, atgMatList):
+            # padding
+            rawDimSeq, seqMask = self.padding(tcrMatList, hlaMatList, atgMatList) 
+                # 3*[batch, length(不定长), dim(1280)] -> [batch, length(72), dim(256)] + [batch, length(72)]
+            # 原始降维
+            downDimSeq = self.downDim(rawDimSeq) # [batch, length(72), dim(1280)] -> [batch, length(72), dim(256)]
+            # 多重 encoder
+            encoderSeq = downDimSeq
+            for enc in self.multiEncoder:
+                encoderSeq = enc(encoderSeq, encoderSeq, seqMask)
+
+            return encoderSeq, seqMask
+        
+
+    return (pTcrStackEncoder,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## decoder
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(nn, torch):
+    class pTcrDecoder(nn.Module):
+        # 注意力池化 decoder
+        # input: encoder 堆叠的输出, [batch, length(72), dim(256)]
+        # output: decoder 向量, [batch, dim(256)]
+        def __init__(self, attentionDim=256):
+            super(pTcrDecoder, self).__init__()
+            # 属性
+            self.attentionDim = attentionDim # encoder 的输出维度
+            # 架构
+            self.preLn = nn.LayerNorm(self.attentionDim, dtype=torch.bfloat16) # pre-LN
+            self.attenLin = nn.Linear(self.attentionDim, 1, dtype=torch.bfloat16) # 注意力池化
+        
+
+        def forward(self, encoderSeq, seqMask):
+            # pre-LN
+            LN_encoderSeq = self.preLn(encoderSeq)
+            # 注意力池化
+            attentionPool = self.attenLin(LN_encoderSeq) # [batch, length(72), dim] -> [batch, length(72), 1]
+            # mask
+            attentionPool = attentionPool.squeeze(-1) # [batch, length(72), 1] -> [batch, length(72)]
+            maskAttention = attentionPool.masked_fill(~seqMask, value=-1e4)
+            # torch.masked_fill(attentionPool, mask=~seqMask, value=1e-9)
+            # softmax
+            maskAttention = torch.softmax(maskAttention, 1) # [batch, length(72)]
+            # weight sum, for per feature(256), weight aa(72)
+            decodeVector = torch.sum(encoderSeq * maskAttention.unsqueeze(-1), dim=1)
+
+            return decodeVector
+
+
+    return (pTcrDecoder,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## 预测头
+    """)
+    return
+
+
+@app.cell(hide_code=True)
+def _(nn, torch):
+    class pTcrClassfier(nn.Module):
+        # input: decoder 后的特征向量, [batch, dim(256)]
+        # output: logit
+        def __init__(self, decoderDim=256, dropoutP=0.1):
+            super(pTcrClassfier, self).__init__()
+            self.decoderDim = decoderDim
+            self.dropoutP = dropoutP
+
+            # 架构
+            self.linLayer1 = nn.Linear(self.decoderDim, self.decoderDim//2, dtype=torch.bfloat16)
+            self.layerNorm = nn.LayerNorm(self.decoderDim//2, dtype=torch.bfloat16)
+            self.activation = nn.GELU()
+            self.drop = nn.Dropout(self.dropoutP)
+            self.linLayer2 = nn.Linear(self.decoderDim//2, 1, dtype=torch.bfloat16)
+        
+        def forward(self, decoderVector):
+            # decoderVector: [batch, dim(256)]
+            # 降维
+            downdimVect = self.linLayer1(decoderVector)
+            # LN
+            LN_Vect = self.layerNorm(downdimVect)
+            # activate
+            actVect = self.activation(LN_Vect)
+            # dropout
+            actVect = self.drop(actVect)
+            # logit
+            vectLogit = self.linLayer2(actVect)
+            vectLogit = vectLogit.squeeze(-1)
+
+            return vectLogit
+
+    return (pTcrClassfier,)
+
+
+@app.cell(hide_code=True)
+def _(mo):
+    mo.md(r"""
+    ## pMHC-TCR 全局框架
+    """)
+    return
+
+
+@app.cell
+def _(nn, pTcrClassfier, pTcrDecoder, pTcrStackEncoder):
+    class pTcrTransformerV01(nn.Module):
+        # input: list of tcr/hla/atg matrix, for each matrix shape is [length, 1280], where length is not fixed
+        # output: 
+            # decoder vector: [batch, 256]
+            # classified logit: [batch]
+        def __init__(self,
+            # padding 和 位置编码
+            tcrMaxLen=25, hlaMaxLen=34, atgMaxLen=13, embedDim = 1280, maxRelDist=16,
+            # 注意力 encoder, decoder, classifier 层
+            hiddenDim = 256, numberHead = 8, hiddenFold=4, dropoutP=0.1, encoderTime=3
+        ):
+            super(pTcrTransformerV01, self).__init__()
+            self.embedDim = embedDim # 输入的特征维度
+            self.attentionDim = hiddenDim # 输入特征降维后, 保持在多轮 encoder 中数据流转维度
+            self.tcrMaxLen = tcrMaxLen
+            self.hlaMaxLen = hlaMaxLen
+            self.atgMaxLen = atgMaxLen
+            self.maxRelDist = maxRelDist # 位置编码中最大相对位置
+            self.numberHead = numberHead # encoder 中注意力头数
+            self.hiddenFold = hiddenFold # encoder FNN 中升维倍数
+            self.dropoutP = dropoutP     # 所有 dropout 概率
+            self.encoderTime = encoderTime
+
+            # 架构
+            self.encoder = pTcrStackEncoder(
+                rowDim=self.embedDim, featureDim=self.attentionDim, 
+                atgMaxLen=self.atgMaxLen, tcrMaxLen=self.tcrMaxLen, hlaMaxLen=self.hlaMaxLen, maxRelDist=self.maxRelDist,
+                numberHead=self.numberHead, upDimFold=self.hiddenFold, dropoutP=self.dropoutP, encoderTime=self.encoderTime
+            )
+            self.decoder = pTcrDecoder(attentionDim=self.attentionDim)
+            self.classifier = pTcrClassfier(decoderDim=self.attentionDim)
+
+        def forward(self, tcrMatList, hlaMatList, atgMatList):
+            # padding and encoder
+            batchEncoderSeq, batchMask = self.encoder(tcrMatList, hlaMatList, atgMatList) # [batch, length(72), dim(256)]
+            # decoder
+            batchDecodeVector = self.decoder(batchEncoderSeq, batchMask) # [batch, dim(256)]
+            # classify
+            batchLogit = self.classifier(batchDecodeVector) # [batch]
+
+            return batchDecodeVector, batchLogit
+        
+
+    return (pTcrTransformerV01,)
 
 
 @app.cell(hide_code=True)
 def _(mo):
     mo.md(r"""
     ## 测试
+
+    - multi encoder 数据流验证成功: 3*list -> [batch, length(72), dim(256)]
+
+    ___
+
+    ## 待学习
+    - nn.dropout 对象
+    - nn.moduleList 对象
+    - 通过 hook 捕获输出
+    - 当前模型总参数量
+    - softmax 对象
     """)
     return
 
 
 @app.cell
-def _(torch):
-    Q = torch.rand(2,2,3,4)
-    K = torch.rand(2,2,3,4)
-
-    return K, Q
-
-
-@app.cell
-def _(Q):
-    Q
-    return
-
-
-@app.cell
-def _(K):
-    K
-    return
+def _(device, random, torch):
+    tcrList = [
+        torch.rand(random.randint(13,25), 1280, device=device, dtype=torch.bfloat16) for _ in range(7)
+    ]
+    hlaList = [
+        torch.rand(34, 1280, device=device, dtype=torch.bfloat16) for _ in range(7)
+    ]
+    atgList = [
+        torch.rand(random.randint(9,13), 1280, device=device, dtype=torch.bfloat16) for _ in range(7)
+    ]
+    return atgList, hlaList, tcrList
 
 
 @app.cell
-def _(K, Q):
-    Q@K.transpose(-2,-1)
-    return
+def _(device, pTcrTransformerV01):
+    testModel = pTcrTransformerV01().to(device)
+    return (testModel,)
 
 
 @app.cell
-def _(tmask):
-    tmask.unsqueeze(2).unsqueeze(3).shape
-    return
+def _(atgList, hlaList, tcrList, testModel):
+    resVec, resLogit = testModel(tcrList, hlaList, atgList)
+    return (resLogit,)
 
 
 @app.cell
-def _(tmask):
-    tmask.unsqueeze(1).unsqueeze(3).shape
-    return
-
-
-@app.cell
-def _(nn):
-    tsoft = nn.Softmax()
-    return (tsoft,)
-
-
-@app.cell
-def _(torch, tsoft):
-    tsoft(torch.tensor([1e-4, 0.1, 0.2, 1.1, 0.8]))
-    return
-
-
-@app.cell
-def _(torch):
-    tmask = torch.tensor([[True, False, True, True], [False, False, True, True]])
-    return (tmask,)
-
-
-@app.cell
-def _(tmask):
-    tmaskRaw = tmask.unsqueeze(1)
-    tmaskCOl = tmask.unsqueeze(2)
-    return tmaskCOl, tmaskRaw
-
-
-@app.cell
-def _(tmaskCOl, tmaskRaw):
-    tmaskCOl & tmaskRaw
-    return
-
-
-@app.cell
-def _(tmaskRaw):
-    tmaskRaw
-    return
-
-
-@app.cell
-def _(tmaskCOl):
-    tmaskCOl.device
-    return
-
-
-@app.cell
-def _(torch):
-    torch.rand(2,3,4).unsqueeze(1).shape
-    return
-
-
-@app.cell
-def _(nn, torch):
-    testEmbd = nn.Embedding(100, 1)
-    testEmbd(torch.arange(48).reshape(6,8)).squeeze().unsqueeze(0)
-    return
-
-
-@app.cell
-def _(torch):
-    atgCore = torch.rand(3,3)
-    atgCore
-    return (atgCore,)
-
-
-@app.cell
-def _(atgCore, nn):
-    atgC = nn.functional.pad(atgCore, pad=[2,0,0,0],mode="constant", value=1)
-    atgC
-    return (atgC,)
-
-
-@app.cell
-def _(atgC, nn):
-    nn.functional.pad(atgC, pad=[2,0,0,0],mode="constant", value=1.2)
+def _(resLogit):
+    resLogit.shape
     return
 
 
